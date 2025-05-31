@@ -15,6 +15,6 @@ export async function faqLeaderboard(
   if (!content.includes('<#')) return
 
   if (client.faqManager.links.some(link => content.includes(link))) {
-    upsertContribution(guildId, member.id)
+    upsertContribution(member.id, guildId)
   }
 }
