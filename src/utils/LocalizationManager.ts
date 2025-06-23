@@ -3,18 +3,29 @@ import type { Client } from 'discord.js'
 
 import { BASE_PROMPT } from './SearchManager'
 import { OPENAI_API_KEY } from '../constants/config'
-import type { LocalizationContext } from './crowdin'
+import type { LocalizationPair } from './crowdin'
 import { type Locale, LOCALES } from '../constants/i18n'
 
 const LOCALIZATION_PROMPT = `
 You are a translation bot specifically for the game Eternal Hero, so the way you translate game terms is important.
 `
 
-const REPHRASING_PROMPT = `
-When rephrasing the FAQ answer into a more digestible answer for the player, it is very important you do not take liberties with the content of the FAQ.
+const SUMMARIZE_PROMPT = `
+When summarizing the FAQ answer into a more digestible and specific answer for the player, it is very important you do not take liberties with the content of the FAQ.
 You must not change the meaning of the answer, and you must not add any information that is not in the FAQ.
 Also be mindful about what appears like game terms, since their meaning can be subtle and matterns.
 `
+
+function provideLocalizationContext(
+  sourceLocale: Locale['languageCode'],
+  targetLocale: Locale['languageCode'],
+  localizationContext: LocalizationPair[]
+) {
+  if (localizationContext.length === 0) return ''
+  return `Here are how some key terms are translated from English into that language (${sourceLocale} → ${targetLocale}):${localizationContext
+    .map(entry => `- “${entry.source}” → ${entry.target}`)
+    .join('\n')}`
+}
 
 export class LocalizationManager {
   #GPT_MODEL = 'gpt-3.5-turbo'
@@ -26,6 +37,31 @@ export class LocalizationManager {
     }
 
     this.openai = new OpenAI({ apiKey: OPENAI_API_KEY })
+  }
+
+  async translate(
+    content: string,
+    sourceLocale: Locale['languageCode'],
+    targetLocale: Locale['languageCode'],
+    localizationContext: LocalizationPair[]
+  ) {
+    const res = await this.openai.chat.completions.create({
+      model: this.#GPT_MODEL,
+      messages: [
+        { role: 'system', content: BASE_PROMPT },
+        {
+          role: 'user',
+          content: `
+          ${LOCALIZATION_PROMPT}
+          Translate the following text (guessed to be in the ‘${sourceLocale}’ locale) into the ‘${targetLocale}’ locale — unless it is already in said locale, in which case return it as is.
+          ${content}
+          
+          ${provideLocalizationContext(sourceLocale, targetLocale, localizationContext)}`,
+        },
+      ],
+    })
+
+    return res.choices[0].message?.content?.trim() ?? content
   }
 
   async translateToEnglish(originalText: string) {
@@ -48,8 +84,8 @@ export class LocalizationManager {
 
   async translateFromEnglish(
     textToLocalize: string,
-    locale: Locale['languageCode'],
-    localizationContext: LocalizationContext
+    targetLocale: Locale['languageCode'],
+    localizationContext: LocalizationPair[]
   ) {
     const response = await this.openai.chat.completions.create({
       model: this.#GPT_MODEL,
@@ -59,16 +95,10 @@ export class LocalizationManager {
           role: 'user',
           content: `
           ${LOCALIZATION_PROMPT}
-          Translate the following text to ${locale}.
+          Translate the following text to ${targetLocale}.
           > ${textToLocalize}
           
-          ${
-            localizationContext
-              ? `Here are how some key terms are translated from English into that language (EN → ${locale}):${localizationContext
-                  .map(entry => `- “${entry.english}” → ${entry.localized}`)
-                  .join('\n')}`
-              : ''
-          }`,
+          ${provideLocalizationContext('en', targetLocale, localizationContext)}`,
         },
       ],
     })
@@ -76,11 +106,11 @@ export class LocalizationManager {
     return response.choices[0].message?.content?.trim()
   }
 
-  async translateFromEnglishAndRephrase(
+  async translateFromEnglishAndSummarize(
     userQuestion: string,
-    locale: Locale['languageCode'],
+    targetLocale: Locale['languageCode'],
     matchedFAQ: { question: string; answer: string },
-    localizationContext: LocalizationContext
+    localizationContext: LocalizationPair[]
   ) {
     const chat = await this.openai.chat.completions.create({
       model: this.#GPT_MODEL,
@@ -95,16 +125,10 @@ export class LocalizationManager {
           Q: ${matchedFAQ.question}
           A: ${matchedFAQ.answer}
           
-          ${REPHRASING_PROMPT}
+          ${SUMMARIZE_PROMPT}
           
-          Respond helpfully in the language used by the player in their question (${locale}).
-          ${
-            localizationContext
-              ? `Here are how some key terms are translated from English into that language (EN → ${locale}):${localizationContext
-                  .map(entry => `- “${entry.english}” → ${entry.localized}`)
-                  .join('\n')}`
-              : ''
-          }`,
+          Respond helpfully in the language used by the player in their question (${targetLocale}).
+          ${provideLocalizationContext('en', targetLocale, localizationContext)}`,
         },
       ],
     })
@@ -112,7 +136,7 @@ export class LocalizationManager {
     return chat.choices[0].message?.content
   }
 
-  async rephrase(
+  async summarize(
     userQuestion: string,
     matchedFAQ: { question: string; answer: string }
   ) {
@@ -129,7 +153,7 @@ export class LocalizationManager {
           Q: ${matchedFAQ.question}
           A: ${matchedFAQ.answer}
           
-          ${REPHRASING_PROMPT}`,
+          ${SUMMARIZE_PROMPT}`,
         },
       ],
     })
@@ -149,8 +173,8 @@ export class LocalizationManager {
             Only respond with one of these supported codes:
             ${LOCALES.map(locale => locale.languageCode)}
 
-            If the user’s message is not clearly in one of those, respond with: unknown
-            Your response must be only the code — no explanations or punctuation.
+            If the user’s message is not clearly in one of those or you can’t figure it out, respond with: UNSUPPORTED
+            Your response must be only the code or UNSUPPORTED — no explanations or punctuation.
             `,
         },
         {
@@ -161,17 +185,13 @@ export class LocalizationManager {
     })
 
     const guess = chat.choices[0].message?.content
+    const isSupported = LOCALES.find(locale => locale.languageCode === guess)
 
-    if (guess === 'unknown') {
-      console.warn('ChatGPT could not guess the language from', userInput)
-      return 'UNKNOWN_LANGUAGE'
-    }
-
-    if (!LOCALES.find(locale => locale.languageCode === guess)) {
+    if (guess === 'UNSUPPORTED' || !isSupported) {
       console.warn(
         `ChatGPT guess the language as “${guess}”, which is not supported; falling back to English.`
       )
-      return 'en'
+      return 'UNSUPPORTED_LANGUAGE'
     }
 
     return guess ?? 'en'

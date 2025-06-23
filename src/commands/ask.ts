@@ -7,6 +7,7 @@ import {
 import { logger } from '../utils/logger'
 import type { PineconeMetadata } from './indexfaq'
 import crowdin from '../utils/crowdin'
+import { LOCALES } from '../constants/i18n'
 
 export const scope = 'OFFICIAL'
 
@@ -43,19 +44,38 @@ export async function execute(interaction: ChatInputCommandInteraction) {
 
   await interaction.deferReply({ flags })
 
-  const guessedLanguage = await localizationManager.guessLanguage(query)
+  // Guess the language of the initial query. It it is not one of the languages
+  // supported by Crowdin, it will fall back to English.
+  const sourceLanguage = await localizationManager.guessLanguage(query)
+
+  // If the source language is not already English, translate the query in
+  // English. That’s necessary because our whole FAQ is in English, so that’s
+  // the language we need to perform the search in. We skip the English to
+  // English translation to a) save on ChatGPT credits and b) avoid butchering
+  // the original query’s intent.
   const englishQuery =
-    guessedLanguage === 'en'
+    sourceLanguage === 'en'
       ? query
       : await localizationManager.translateToEnglish(query)
+
+  // Perform the search with Pinecone, and pick a single result. This could be
+  // improved in the future to pick several results, and feed them all to
+  // ChatGPT and ask to summarize.
   const { results } = await searchManager.search(englishQuery, 'VECTOR', 1)
   const [result] = results
 
+  // If we couldn’t get any result, stop there. If the source language is one
+  // of the languages we support on Discord, use the pre-translated error
+  // message, otherwise fall back to English. We could translate the English
+  // message with ChatGPT but that would consume credits for something not very
+  // useful.
   if (!result) {
-    return interaction.editReply({
-      content:
-        'Unfortunately, no relevant content was found for your question. Please try rephrasing it or ask a different question.',
-    })
+    const locale =
+      LOCALES.find(locale => locale.languageCode === sourceLanguage) ??
+      // biome-ignore lint/style/noNonNullAssertion: <explanation>
+      LOCALES.find(locale => locale.languageCode === 'en')!
+
+    return interaction.editReply({ content: locale.messages.no_results })
   }
 
   const { entry_question: question, entry_answer: answer } =
@@ -63,30 +83,43 @@ export async function execute(interaction: ChatInputCommandInteraction) {
   const id = result._id.split('#')[1]
   const context = { question, answer }
 
-  if (guessedLanguage === 'en') {
+  // If the source language was English, either return the raw FAQ answer if in
+  // raw mode, or ask ChatGPT to summarize if not. If ChatGPT failed to answer,
+  // return the raw FAQ answer as a fallback.
+  if (sourceLanguage === 'en') {
     if (raw) return interaction.editReply({ content: answer })
-    const rephrased = await localizationManager.rephrase(query, context)
-    return interaction.editReply({ content: rephrased ?? answer })
+    const summarized = await localizationManager.summarize(query, context)
+    return interaction.editReply({ content: summarized ?? answer })
   }
 
+  // If the source language was not English (treated previously) and is a
+  // language we support on Crowdin, compute some translation context for
+  // ChatGPT by looking up the translations for terms that are associated to
+  // that FAQ entry.
   const localizationContext =
-    guessedLanguage !== 'UNKNOWN_LANGUAGE'
-      ? await crowdin.getTranslationsForThread(id, guessedLanguage)
+    sourceLanguage !== 'UNSUPPORTED_LANGUAGE'
+      ? await crowdin.getTranslationsForThread(id, 'en', sourceLanguage)
       : []
 
+  // If in raw mode, translate the FAQ entry into the source language using the
+  // provided context as help, and return it. If ChatGPT failed to answer,
+  // return the raw FAQ answer as a fallback.
   if (raw) {
     const localized = await localizationManager.translateFromEnglish(
       answer,
-      guessedLanguage,
+      sourceLanguage,
       localizationContext
     )
     return interaction.editReply({ content: localized ?? answer })
   }
 
+  // If not in raw mode, translate the FAQ entry into the source language using
+  // the provided context as help, and ask ChatGPT to summarize it. If ChatGPT
+  // failed to answer, return the raw FAQ answer as a fallback.
   const localizedAndRephrased =
-    await localizationManager.translateFromEnglishAndRephrase(
+    await localizationManager.translateFromEnglishAndSummarize(
       query,
-      guessedLanguage,
+      sourceLanguage,
       context,
       localizationContext
     )
