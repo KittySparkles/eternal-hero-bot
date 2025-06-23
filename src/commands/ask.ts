@@ -6,6 +6,7 @@ import {
 
 import { logger } from '../utils/logger'
 import type { PineconeMetadata } from './indexfaq'
+import crowdin from '../utils/crowdin'
 
 export const scope = 'OFFICIAL'
 
@@ -42,7 +43,11 @@ export async function execute(interaction: ChatInputCommandInteraction) {
 
   await interaction.deferReply({ flags })
 
-  const englishQuery = await localizationManager.translateToEnglish(query)
+  const guessedLanguage = await localizationManager.guessLanguage(query)
+  const englishQuery =
+    guessedLanguage === 'en'
+      ? query
+      : await localizationManager.translateToEnglish(query)
   const { results } = await searchManager.search(englishQuery, 'VECTOR', 1)
   const [result] = results
 
@@ -55,13 +60,35 @@ export async function execute(interaction: ChatInputCommandInteraction) {
 
   const { entry_question: question, entry_answer: answer } =
     result.fields as PineconeMetadata
+  const id = result._id.split('#')[1]
+  const context = { question, answer }
 
-  const localizedAnswer = raw
-    ? await localizationManager.translateFromEnglish(answer, query)
-    : await localizationManager.translateFromEnglishAndRephrase(query, {
-        question,
-        answer,
-      })
+  if (guessedLanguage === 'en') {
+    if (raw) return interaction.editReply({ content: answer })
+    const rephrased = await localizationManager.rephrase(query, context)
+    return interaction.editReply({ content: rephrased ?? answer })
+  }
 
-  return interaction.editReply({ content: localizedAnswer ?? answer })
+  const localizationContext =
+    guessedLanguage !== 'UNKNOWN_LANGUAGE'
+      ? await crowdin.getTranslationsForThread(id, guessedLanguage)
+      : []
+
+  if (raw) {
+    const localized = await localizationManager.translateFromEnglish(
+      answer,
+      guessedLanguage,
+      localizationContext
+    )
+    return interaction.editReply({ content: localized ?? answer })
+  }
+
+  const localizedAndRephrased =
+    await localizationManager.translateFromEnglishAndRephrase(
+      query,
+      guessedLanguage,
+      context,
+      localizationContext
+    )
+  return interaction.editReply({ content: localizedAndRephrased ?? answer })
 }

@@ -193,6 +193,7 @@ export class SearchManager {
           entry_tags: [],
           entry_date: result.item.createdAt?.toISOString() ?? '',
           entry_url: result.item.url,
+          entry_related_translation_ids: [],
         },
       }
     }

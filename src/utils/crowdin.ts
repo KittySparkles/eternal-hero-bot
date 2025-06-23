@@ -89,6 +89,81 @@ async function cacheCrowdinStrings(strings: SourceStringsModel.String[]) {
   }
 }
 
+export type LocalizationContext = {
+  id: string
+  english: string
+  localized: string
+}[]
+
+export async function getTranslationsForThread(
+  threadId: string,
+  locale: string
+): Promise<LocalizationContext> {
+  // Step 1: Get all string IDs linked to this thread
+  const result = await pool.query(
+    'SELECT string_id FROM thread_to_crowdin_string WHERE thread_id = $1',
+    [threadId]
+  )
+  const stringIds = result.rows.map(row => row.string_id)
+  if (stringIds.length === 0) return []
+
+  // Step 2: Get English (original) strings from crowdin_strings
+  const englishRes = await pool.query(
+    'SELECT string_id, text FROM crowdin_strings WHERE string_id = ANY($1::int[])',
+    [stringIds]
+  )
+  const englishMap = new Map<number, string>()
+  for (const row of englishRes.rows) {
+    englishMap.set(row.string_id, row.text)
+  }
+
+  // Step 3: Get cached translations
+  const cached = await pool.query(
+    `SELECT string_id, translated_text FROM crowdin_translations
+     WHERE string_id = ANY($1::int[]) AND language = $2`,
+    [stringIds, locale]
+  )
+  const translatedMap = new Map<number, string>()
+  for (const row of cached.rows) {
+    translatedMap.set(row.string_id, row.translated_text)
+  }
+
+  const missing = stringIds.filter(id => !translatedMap.has(id))
+
+  const language = await getLanguage(locale)
+  if (!language) return []
+
+  // Step 3: Fetch and cache any missing ones
+  for (const stringId of missing) {
+    const translation = await getProjectStringTranslation(stringId, language)
+    const translatedText = translation.translation.data.text ?? ''
+
+    if (translatedText) {
+      translatedMap.set(stringId, translatedText)
+
+      await pool.query(
+        `INSERT INTO crowdin_translations (string_id, language, translated_text)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (string_id, language)
+         DO UPDATE SET translated_text = EXCLUDED.translated_text, last_synced_at = now()`,
+        [stringId, language, translatedText]
+      )
+    }
+  }
+
+  // Step 4: Return all translated strings in order
+  return stringIds
+    .map(id => {
+      const english = englishMap.get(id)
+      const localized = translatedMap.get(id)
+      if (english && localized) {
+        return { id: id, english, localized }
+      }
+      return null
+    })
+    .filter(value => value !== null)
+}
+
 async function getLanguage(locale: string) {
   const { targetLanguages: languages } = await getProject()
   return languages.find(language => language.id === locale)
@@ -142,4 +217,7 @@ export default {
   getStringTranslationsForAllLanguages,
   getStringTranslations,
   getLanguage,
+  getProjectStrings,
+  cacheCrowdinStrings,
+  getTranslationsForThread,
 }

@@ -13,6 +13,10 @@ import type {
 import { logger } from '../utils/logger'
 import crowdin, { CROWDIN_PROJECT_ID } from '../utils/crowdin'
 import { LOCALES } from '../constants/i18n'
+import { resolveThread } from './indexfaq'
+import Fuse from 'fuse.js'
+import fuzzysort from 'fuzzysort'
+import { pool } from '../utils/pg'
 
 export const scope = 'OFFICIAL'
 
@@ -70,6 +74,11 @@ export const data = new SlashCommandBuilder()
           .setDescription('Whether it should show for everyone')
       )
   )
+  .addSubcommand(subcommand =>
+    subcommand
+      .setName('index')
+      .setDescription('Index FAQ entries to translation keys')
+  )
   .setDescription('Interact with Crowdin')
 
 export async function execute(interaction: ChatInputCommandInteraction) {
@@ -84,6 +93,10 @@ export async function execute(interaction: ChatInputCommandInteraction) {
 
   if (options.getSubcommand() === 'term') {
     return commandTerm(interaction)
+  }
+
+  if (options.getSubcommand() === 'index') {
+    return commandIndex(interaction)
   }
 }
 
@@ -251,4 +264,69 @@ function formatTranslation({
 
 function formatLanguage(language: LanguagesModel.Language) {
   return `${language.name} (\`${language.locale}\`)`
+}
+
+async function commandIndex(interaction: ChatInputCommandInteraction) {
+  await interaction.deferReply({ flags: MessageFlags.Ephemeral })
+
+  await interaction.editReply({
+    content: 'Fetching all strings from Crowdin…',
+  })
+  const allTerms = await crowdin.getProjectStrings(CROWDIN_PROJECT_ID)
+  await crowdin.cacheCrowdinStrings(allTerms)
+
+  await interaction.editReply({
+    content: 'Building a thread-to-keys index…',
+  })
+
+  const matches: Array<{ thread_id: string; string_id: number }> = []
+
+  for (const thread of interaction.client.faqManager.threads) {
+    const resolvedThread = await resolveThread(thread)
+    for (const term of allTerms) {
+      const englishTerm = (term.text as string)
+        .replace(/\{0:plural:([^|}]+)\|[^}]+\}/g, (_, s) => s)
+        .replace(/<[a-z=]+>/g, '')
+        .replace(/<\/[a-z=]+>/g, '')
+
+      const match = fuzzysort.single(englishTerm, resolvedThread.content)
+      if (match && match.score > 0.5)
+        matches.push({
+          thread_id: resolvedThread.id,
+          string_id: term.id,
+        })
+    }
+  }
+
+  const seen = new Set<string>()
+  const deduped = matches.filter(({ thread_id, string_id }) => {
+    const key = `${thread_id}:${string_id}`
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
+  })
+
+  if (deduped.length > 0) {
+    const values: string[] = []
+    const params: (string | number)[] = []
+
+    deduped.forEach(({ thread_id, string_id }, i) => {
+      const offset = i * 2
+      values.push(`($${offset + 1}, $${offset + 2})`)
+      params.push(thread_id, string_id)
+    })
+
+    await pool.query(
+      `
+      INSERT INTO thread_to_crowdin_string (thread_id, string_id)
+      VALUES ${values.join(', ')}
+      ON CONFLICT DO NOTHING
+      `,
+      params
+    )
+  }
+
+  return interaction.editReply({
+    content: `Inserted ${deduped.length} mappings.`,
+  })
 }
