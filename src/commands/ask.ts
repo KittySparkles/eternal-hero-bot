@@ -1,8 +1,10 @@
 import {
   type ChatInputCommandInteraction,
+  type Client,
   MessageFlags,
   SlashCommandBuilder,
 } from 'discord.js'
+import type { Index } from '@pinecone-database/pinecone'
 
 import { logger } from '../utils/logger'
 import type { PineconeMetadata } from './indexfaq'
@@ -48,20 +50,27 @@ export async function execute(interaction: ChatInputCommandInteraction) {
   // supported by Crowdin, it will fall back to English.
   const sourceLanguage = await localizationManager.guessLanguage(query)
 
+  // If the source language is already indexed in Pinecone (namespace named
+  // after it exists), either return the raw FAQ answer if in raw mode, or ask
+  // ChatGPT to summarize if not. If ChatGPT failed to answer, return the raw
+  // FAQ answer as a fallback.
+  if (await searchManager.namespaceExists(sourceLanguage)) {
+    return handleSearch(client, query, sourceLanguage, raw)
+  }
+
   // If the source language is not already English, translate the query in
   // English. That’s necessary because our whole FAQ is in English, so that’s
-  // the language we need to perform the search in. We skip the English to
-  // English translation to a) save on ChatGPT credits and b) avoid butchering
-  // the original query’s intent.
+  // the language we need to perform the search in.
   const englishQuery =
-    sourceLanguage === 'en'
-      ? query
-      : await localizationManager.translateToEnglish(query)
+    (await localizationManager.translateToEnglish(query)) ?? query
 
   // Perform the search with Pinecone, and pick a single result. This could be
   // improved in the future to pick several results, and feed them all to
   // ChatGPT and ask to summarize.
-  const { results } = await searchManager.search(englishQuery, 'VECTOR', 1)
+  const { results } = await searchManager.search(englishQuery, 'VECTOR', {
+    limit: 1,
+    namespace: 'en',
+  })
   const [result] = results
 
   // If we couldn’t get any result, stop there. If the source language is one
@@ -78,28 +87,18 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     return interaction.editReply({ content: locale.messages.no_results })
   }
 
-  const { entry_question: question, entry_answer: answer } =
-    result.fields as PineconeMetadata
-  const id = result._id.split('#')[1]
-  const context = { question, answer }
-
-  // If the source language was English, either return the raw FAQ answer if in
-  // raw mode, or ask ChatGPT to summarize if not. If ChatGPT failed to answer,
-  // return the raw FAQ answer as a fallback.
-  if (sourceLanguage === 'en') {
-    if (raw) return interaction.editReply({ content: answer })
-    const summarized = await localizationManager.summarize(query, context)
-    return interaction.editReply({ content: summarized ?? answer })
-  }
-
   // If the source language was not English (treated previously) and is a
   // language we support on Crowdin, compute some translation context for
   // ChatGPT by looking up the translations for terms that are associated to
   // that FAQ entry.
+  const id = result._id.split('#')[1]
   const localizationContext =
     sourceLanguage !== 'UNSUPPORTED_LANGUAGE'
       ? await crowdin.getTranslationsForThread(id, 'en', sourceLanguage)
       : []
+
+  const { entry_question: question, entry_answer: answer } =
+    result.fields as PineconeMetadata
 
   // If in raw mode, translate the FAQ entry into the source language using the
   // provided context as help, and return it. If ChatGPT failed to answer,
@@ -120,8 +119,28 @@ export async function execute(interaction: ChatInputCommandInteraction) {
     await localizationManager.translateFromEnglishAndSummarize(
       query,
       sourceLanguage,
-      context,
+      { question, answer },
       localizationContext
     )
   return interaction.editReply({ content: localizedAndRephrased ?? answer })
+}
+
+async function handleSearch(
+  client: Client,
+  query: string,
+  language: string,
+  raw: boolean
+) {
+  const { searchManager, localizationManager } = client
+  const { results } = await searchManager.search(query, 'VECTOR', {
+    limit: 1,
+    namespace: language,
+  })
+  const [result] = results
+  const { entry_question: question, entry_answer: answer } =
+    result.fields as PineconeMetadata
+  const context = { question, answer }
+  if (raw) return answer
+  const summarized = await localizationManager.summarize(query, context)
+  return summarized ?? answer
 }

@@ -9,13 +9,11 @@ import type {
   StringTranslationsModel,
   TranslationStatusModel,
 } from '@crowdin/crowdin-api-client'
+import fuzzysort from 'fuzzysort'
 
 import { logger } from '../utils/logger'
 import crowdin, { CROWDIN_PROJECT_ID } from '../utils/crowdin'
 import { LOCALES } from '../constants/i18n'
-import { resolveThread } from './indexfaq'
-import Fuse from 'fuse.js'
-import fuzzysort from 'fuzzysort'
 import { pool } from '../utils/pg'
 
 export const scope = 'OFFICIAL'
@@ -269,6 +267,8 @@ function formatLanguage(language: LanguagesModel.Language) {
 async function commandIndex(interaction: ChatInputCommandInteraction) {
   await interaction.deferReply({ flags: MessageFlags.Ephemeral })
 
+  const { client } = interaction
+
   await interaction.editReply({
     content: 'Fetching all strings from Crowdin…',
   })
@@ -281,8 +281,8 @@ async function commandIndex(interaction: ChatInputCommandInteraction) {
 
   const matches: Array<{ thread_id: string; string_id: number }> = []
 
-  for (const thread of interaction.client.faqManager.threads) {
-    const resolvedThread = await resolveThread(thread)
+  for (const thread of client.faqManager.threads) {
+    const resolvedThread = await client.faqManager.resolveThread(thread)
     for (const term of allTerms) {
       const englishTerm = (term.text as string)
         .replace(/\{0:plural:([^|}]+)\|[^}]+\}/g, (_, s) => s)

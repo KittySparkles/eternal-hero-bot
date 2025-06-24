@@ -1,4 +1,4 @@
-import { Events, type Client } from 'discord.js'
+import type { Client } from 'discord.js'
 import {
   type Index,
   Pinecone,
@@ -9,7 +9,8 @@ import type { AnyThreadChannel } from 'discord.js'
 import Fuse, { type FuseResult } from 'fuse.js'
 
 import { PINECONE_API_KEY } from '../constants/config'
-import type { PineconeMetadata } from '../commands/indexfaq'
+import type { PineconeEntry, PineconeMetadata } from '../commands/indexfaq'
+import type { ResolvedThread } from './FAQManager'
 
 type Hit = SearchRecordsResponse['result']['hits'][number]
 type SearchResultVector = Hit & { fields: PineconeMetadata }
@@ -50,17 +51,17 @@ const FUZZY_SEARCH_OPTIONS = {
 
 export class SearchManager {
   // This is the name of the index on Pinecone
-  #INDEX_NAME = 'faq-index'
+  INDEX_NAME = 'faq-index'
 
+  pc: Pinecone
   index: Index<RecordMetadata>
   client: Client
   altFuse: Fuse<{ from: string; to: string }>
 
   constructor(client: Client) {
     this.client = client
-    this.index = new Pinecone({ apiKey: PINECONE_API_KEY ?? '_' })
-      .index(this.#INDEX_NAME)
-      .namespace('en')
+    this.pc = new Pinecone({ apiKey: PINECONE_API_KEY ?? '_' })
+    this.index = this.pc.index(this.INDEX_NAME)
 
     this.altFuse = new Fuse(
       [
@@ -83,7 +84,7 @@ export class SearchManager {
   async search(
     query: string,
     type: SearchType,
-    limit = 1
+    { limit = 1, namespace = 'en' } = {}
   ): Promise<{ query: string; results: SearchResult[] }> {
     if (!PINECONE_API_KEY && type === 'VECTOR') {
       type = 'FUZZY'
@@ -94,7 +95,7 @@ export class SearchManager {
 
     if (type === 'VECTOR') {
       try {
-        const hits = await this.searchVector(query, limit)
+        const hits = await this.searchVector(namespace, query, limit)
         return {
           query,
           results: hits.filter(this.isHitRelevant).map(this.normalizeResult),
@@ -104,7 +105,7 @@ export class SearchManager {
           'Vector search failed; falling back to fuzzy search.',
           error
         )
-        return this.search(query, 'FUZZY', limit)
+        return this.search(query, 'FUZZY', { limit, namespace })
       }
     }
 
@@ -124,8 +125,8 @@ export class SearchManager {
 
   // Perform a vector search with Pinecone, with immediate reranking for better
   // results.
-  async searchVector(query: string, limit = 1) {
-    const response = await this.index.searchRecords({
+  async searchVector(namespace: string, query: string, limit = 1) {
+    const response = await this.index.namespace(namespace).searchRecords({
       query: { topK: limit, inputs: { text: query } },
       rerank: {
         model: 'bge-reranker-v2-m3',
@@ -193,12 +194,39 @@ export class SearchManager {
           entry_tags: [],
           entry_date: result.item.createdAt?.toISOString() ?? '',
           entry_url: result.item.url,
-          entry_related_translation_ids: [],
         },
       }
     }
 
     return result
+  }
+
+  async indexRecords(namespaceName: string, records: PineconeEntry[]) {
+    const index = this.index.namespace(namespaceName)
+    const count = records.length
+    while (records.length) {
+      const batch = records.splice(0, 90)
+      await index.upsertRecords(batch)
+    }
+    return count
+  }
+
+  prepareForIndexing(entry: ResolvedThread): PineconeEntry {
+    return {
+      id: `entry#${entry.id}`,
+      chunk_text: `${entry.name}\n\n${entry.content}`,
+      entry_question: entry.name,
+      entry_answer: entry.content,
+      entry_date: entry.createdAt ?? '',
+      entry_tags: entry.tags,
+      entry_url: entry.url,
+    }
+  }
+
+  async namespaceExists(namespace: string) {
+    const { namespaces } = await this.index.describeIndexStats()
+    // biome-ignore lint/suspicious/noPrototypeBuiltins: <explanation>
+    return namespaces?.hasOwnProperty(namespace)
   }
 }
 

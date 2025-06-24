@@ -2,7 +2,7 @@ import {
   type ThreadChannel,
   type Guild,
   Events,
-  type ForumChannel,
+  ForumChannel,
   type Client,
   type AnyThreadChannel,
 } from 'discord.js'
@@ -10,10 +10,22 @@ import {
 import { DISCORD_SERVER_ID, TEST_SERVER_ID } from '../constants/discord'
 import { IS_DEV } from '../constants/config'
 import { logger } from './logger'
+import { LOCALES } from '../constants/i18n'
+import type { LocalizationPair } from './crowdin'
+import { cleanUpString } from './cleanUpString'
 
-const FAQ_FORUM_NAME = '❓│faq-guide'
+export type ResolvedThread = {
+  id: string
+  name: string
+  createdAt: string
+  content: string
+  tags: string[]
+  url: string
+}
 
 export class FAQManager {
+  #FORUM_NAME = '❓│faq-guide'
+
   client: Client
   guildId: string
   #threads: AnyThreadChannel[]
@@ -78,28 +90,164 @@ export class FAQManager {
   }
 
   getFAQForum(guild: Guild) {
-    const faq = guild.channels.cache.find(({ name }) => name === FAQ_FORUM_NAME)
+    const faq = guild.channels.cache.find(
+      ({ name }) => name === this.#FORUM_NAME
+    )
     if (!faq) throw new Error('Could not find the FAQ forum.')
     return faq as ForumChannel
   }
 
-  onThreadCreateOrDelete({ parentId, guild }: ThreadChannel) {
-    const belongsToFAQ = parentId === this.getFAQForum(guild)?.id
-    if (belongsToFAQ) this.cacheThreads()
+  async onThreadCreate(thread: AnyThreadChannel) {
+    const belongsToFAQ = thread.parentId === this.getFAQForum(thread.guild)?.id
+
+    if (belongsToFAQ) {
+      const localizationManager = this.client.localizationManager
+      const searchManager = this.client.searchManager
+      const resolvedThread = await this.resolveThread(thread)
+      this.cacheThreads()
+
+      const translations = await localizationManager.getProjectTranslations()
+
+      for (const { languageCode, crowdin } of LOCALES) {
+        if (!crowdin) continue
+        // @TODO: remove namespaceExists check
+        if (!(await searchManager.namespaceExists(languageCode))) continue
+
+        // Build a localization context for this language
+        const localizationContext: LocalizationPair[] = translations
+          .map(term => ({
+            id: term.id,
+            source: cleanUpString(term.en),
+            target: cleanUpString(term[languageCode]),
+          }))
+          .filter(entry => entry.source && entry.target)
+
+        // Build a glossary for this specific entry
+        const glossary = localizationManager.buildGlossaryForEntry(
+          `${resolvedThread.name}\n${resolvedThread.content}`,
+          localizationContext
+        )
+
+        // Translate it
+        const localized = await localizationManager.translateEntry(
+          resolvedThread,
+          languageCode,
+          glossary
+        )
+
+        // Prepare it for indexing
+        const record = searchManager.prepareForIndexing({
+          ...resolvedThread,
+          ...localized,
+        })
+
+        // Record it
+        await searchManager.indexRecords(languageCode, [record])
+      }
+    }
   }
 
-  onThreadUpdate(
-    { parentId, guild, name }: ThreadChannel,
-    { name: newName }: ThreadChannel
-  ) {
+  async onThreadDelete({ id, parentId, guild }: AnyThreadChannel) {
     const belongsToFAQ = parentId === this.getFAQForum(guild)?.id
-    if (belongsToFAQ && name !== newName) this.cacheThreads()
+    if (belongsToFAQ) {
+      const searchManager = this.client.searchManager
+      this.cacheThreads()
+
+      for (const { languageCode, crowdin } of LOCALES) {
+        if (!crowdin) continue
+        // @TODO: remove namespaceExists check
+        if (!(await searchManager.namespaceExists(languageCode))) continue
+        await searchManager.index.namespace(languageCode).deleteOne(id)
+      }
+    }
+  }
+
+  async onThreadUpdate(
+    oldThread: AnyThreadChannel,
+    newThread: AnyThreadChannel
+  ) {
+    const { parentId, guild, name: oldName } = oldThread
+    const { name: newName } = newThread
+    const belongsToFAQ = parentId === this.getFAQForum(guild)?.id
+
+    if (belongsToFAQ && oldName !== newName) {
+      const localizationManager = this.client.localizationManager
+      const searchManager = this.client.searchManager
+      const resolvedThread = await this.resolveThread(newThread)
+      this.cacheThreads()
+
+      const translations = await localizationManager.getProjectTranslations()
+
+      for (const { languageCode, crowdin } of LOCALES) {
+        if (!crowdin) continue
+        // @TODO: remove namespaceExists check
+        if (!(await searchManager.namespaceExists(languageCode))) continue
+
+        // Build a localization context for this language
+        const localizationContext: LocalizationPair[] = translations
+          .map(term => ({
+            id: term.id,
+            source: cleanUpString(term.en),
+            target: cleanUpString(term[languageCode]),
+          }))
+          .filter(entry => entry.source && entry.target)
+
+        // Build a glossary for this specific entry
+        const glossary = localizationManager.buildGlossaryForEntry(
+          `${resolvedThread.name}\n${resolvedThread.content}`,
+          localizationContext
+        )
+
+        // Translate it
+        const localized = await localizationManager.translateEntry(
+          resolvedThread,
+          languageCode,
+          glossary
+        )
+
+        // Prepare it for indexing
+        const record = searchManager.prepareForIndexing({
+          ...resolvedThread,
+          ...localized,
+        })
+
+        // Record it
+        await searchManager.indexRecords(languageCode, [record])
+      }
+    }
+  }
+
+  getThreadTags(thread: AnyThreadChannel) {
+    if (!(thread.parent instanceof ForumChannel)) {
+      return []
+    }
+
+    return thread.appliedTags
+      .map(
+        id =>
+          (thread.parent as ForumChannel).availableTags.find(pt => pt.id === id)
+            ?.name ?? ''
+      )
+      .filter(Boolean)
+  }
+
+  async resolveThread(thread: AnyThreadChannel): Promise<ResolvedThread> {
+    const firstMessage = await thread.fetchStarterMessage()
+
+    return {
+      id: thread.id,
+      name: thread.name,
+      createdAt: thread.createdAt?.toISOString() ?? '',
+      content: firstMessage?.content ?? '',
+      tags: this.getThreadTags(thread),
+      url: thread.url,
+    }
   }
 
   bindEvents() {
     this.client.once(Events.ClientReady, this.cacheThreads.bind(this))
-    this.client.on(Events.ThreadCreate, this.onThreadCreateOrDelete.bind(this))
-    this.client.on(Events.ThreadDelete, this.onThreadCreateOrDelete.bind(this))
+    this.client.on(Events.ThreadCreate, this.onThreadCreate.bind(this))
+    this.client.on(Events.ThreadDelete, this.onThreadDelete.bind(this))
     this.client.on(Events.ThreadUpdate, this.onThreadUpdate.bind(this))
   }
 }
